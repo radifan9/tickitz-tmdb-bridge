@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // TMDB API configuration
@@ -265,7 +266,7 @@ func generateSQLSeeds(movies []Movie, allPeople []Person, movieActors []MovieAct
 		}
 		sql.WriteString(fmt.Sprintf("    (%d, '%s')", genre.ID, genre.Name))
 	}
-	sql.WriteString("\nON CONFLICT (id) DO NOTHING;\n\n")
+	sql.WriteString("\nON CONFLICT (id) DO NOTHING;\nSELECT setval('genres_id_seq', (SELECT MAX(id) FROM genres));\n\n")
 
 	// Insert people (actors and directors)
 	if len(allPeople) > 0 {
@@ -278,12 +279,12 @@ func generateSQLSeeds(movies []Movie, allPeople []Person, movieActors []MovieAct
 			name := strings.ReplaceAll(person.Name, "'", "''")
 			sql.WriteString(fmt.Sprintf("    (%d, '%s')", person.ID, name))
 		}
-		sql.WriteString("\nON CONFLICT (id) DO NOTHING;\n\n")
+		sql.WriteString("\nON CONFLICT (id) DO NOTHING;\nSELECT setval('people_id_seq', (SELECT MAX(id) FROM people));\n\n")
 	}
 
 	// Insert movies
 	sql.WriteString("-- Insert movies\n")
-	for _, movie := range movies {
+	for i, movie := range movies {
 		title := strings.ReplaceAll(movie.Title, "'", "''")
 		synopsis := strings.ReplaceAll(movie.Overview, "'", "''")
 
@@ -306,18 +307,24 @@ func generateSQLSeeds(movies []Movie, allPeople []Person, movieActors []MovieAct
 		}
 
 		sql.WriteString(fmt.Sprintf(
-			"INSERT INTO movies (id, title, synopsis, poster_img, backdrop_img, duration_minutes, release_date, director_id) OVERRIDING SYSTEM VALUE VALUES (%d, '%s', '%s', '%s', '%s', %s, %s, %s) ON CONFLICT (id) DO NOTHING;\n",
+			"INSERT INTO movies (id, title, synopsis, poster_img, backdrop_img, duration_minutes, release_date, director_id) OVERRIDING SYSTEM VALUE VALUES (%d, '%s', '%s', '%s', '%s', %s, %s, %s) ON CONFLICT (id) DO NOTHING",
 			movie.ID,
 			title,
 			synopsis,
-			movie.PosterPath,
-			movie.BackdropPath,
+			strings.ToLower(movie.PosterPath),   // ✅ Make poster_img lowercase
+			strings.ToLower(movie.BackdropPath), // ✅ Make backdrop_img lowercase
 			runtimeStr,
 			releaseDateStr,
 			directorIDStr,
 		))
+
+		// Add semicolon and newline for each movie, except the last one gets the sequence reset
+		if i == len(movies)-1 {
+			sql.WriteString(";\nSELECT setval('movies_id_seq', (SELECT MAX(id) FROM movies));\n\n")
+		} else {
+			sql.WriteString(";\n")
+		}
 	}
-	sql.WriteString("\n")
 
 	// Insert movie_genres associations
 	sql.WriteString("-- Insert movie_genres associations\n")
@@ -499,7 +506,7 @@ func downloadImage(imageURL, savePath string) error {
 // sanitizeFilename removes/replaces characters that are not safe for filenames
 func sanitizeFilename(filename string) string {
 	// Replace unsafe characters with underscores
-	unsafe := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|"}
+	unsafe := []string{"/", "\\", ":", "*", "?", "\"", "<", ">", "|", "'", " "}
 	for _, char := range unsafe {
 		filename = strings.ReplaceAll(filename, char, "_")
 	}
@@ -518,6 +525,7 @@ func downloadMovieImages(movie Movie) DownloadResult {
 	// Download poster
 	if movie.PosterPath != "" {
 		posterFilename := fmt.Sprintf("%d_%s_poster%s", movie.ID, sanitizedTitle, filepath.Ext(movie.PosterPath))
+		posterFilename = strings.ToLower(posterFilename) // ✅ Make filename lowercase
 		posterPath := filepath.Join("images", "posters", posterFilename)
 
 		if err := downloadImage(movie.PosterPath, posterPath); err != nil {
@@ -531,6 +539,7 @@ func downloadMovieImages(movie Movie) DownloadResult {
 	// Download backdrop
 	if movie.BackdropPath != "" {
 		backdropFilename := fmt.Sprintf("%d_%s_backdrop%s", movie.ID, sanitizedTitle, filepath.Ext(movie.BackdropPath))
+		backdropFilename = strings.ToLower(backdropFilename) // ✅ Make filename lowercase
 		backdropPath := filepath.Join("images", "backdrops", backdropFilename)
 
 		if err := downloadImage(movie.BackdropPath, backdropPath); err != nil {
@@ -595,6 +604,31 @@ func processMovieWithCredits(movie Movie) (Movie, []Person, []MovieActor, Downlo
 	if imageResult.Error != "" {
 		result.Error += imageResult.Error
 	}
+	// ✅ NEW: overwrite movie paths with local file paths
+	// if imageResult.PosterPath != "" {
+	// 	detailedMovie.PosterPath = imageResult.PosterPath
+	// }
+	// if imageResult.BackdropPath != "" {
+	// 	detailedMovie.BackdropPath = imageResult.BackdropPath
+	// }
+	if imageResult.PosterPath != "" {
+		detailedMovie.PosterPath = filepath.Base(imageResult.PosterPath) // ✅ just filename
+	}
+	if imageResult.BackdropPath != "" {
+		detailedMovie.BackdropPath = filepath.Base(imageResult.BackdropPath) // ✅ just filename
+	}
+
+	// ✅ Shift release year if it's 2025 → 2026
+	if detailedMovie.ReleaseDate != "" && strings.HasPrefix(detailedMovie.ReleaseDate, "2025") {
+		// Try parsing as YYYY-MM-DD
+		if t, err := time.Parse("2006-01-02", detailedMovie.ReleaseDate); err == nil {
+			newDate := t.AddDate(1, 0, 0) // add 1 year
+			detailedMovie.ReleaseDate = newDate.Format("2006-01-02")
+		} else {
+			// Fallback: simple string replace if format unexpected
+			detailedMovie.ReleaseDate = strings.Replace(detailedMovie.ReleaseDate, "2025", "2026", 1)
+		}
+	}
 
 	return *detailedMovie, allPeople, movieActors, result, nil
 }
@@ -614,9 +648,9 @@ func removeDuplicatePeople(people []Person) []Person {
 	return result
 }
 
-// fetchAndDownload200Movies fetches and downloads images for 200 movies with credits
+// fetchAndDownload200Movies fetches and downloads images for 400 movies with credits
 func fetchAndDownload200Movies() error {
-	fmt.Println("Starting to fetch and download 200 popular movies with credits...")
+	fmt.Println("Starting to fetch and download 400 popular movies with credits...")
 
 	// Initialize SQL file
 	sqlFilename := "movie_seeds_with_credits.sql"
@@ -631,8 +665,8 @@ func fetchAndDownload200Movies() error {
 	var allMovieActors []MovieActor
 	totalMovies := 0
 
-	// Fetch movies from multiple pages to get 200 movies
-	for page := 1; totalMovies < 200; page++ {
+	// Fetch movies from multiple pages to get 400 movies
+	for page := 1; totalMovies < 400; page++ {
 		fmt.Printf("Fetching page %d...\n", page)
 
 		tmdbResponse, err := fetchMovies(page)
@@ -643,7 +677,7 @@ func fetchAndDownload200Movies() error {
 		// Process movies from this page
 		moviesFromThisPage := 0
 		for _, movie := range tmdbResponse.Results {
-			if totalMovies >= 200 {
+			if totalMovies >= 400 {
 				break
 			}
 
@@ -736,7 +770,7 @@ func main() {
 		return
 	}
 
-	// Automatically fetch and download 200 movies with credits
+	// Automatically fetch and download 400 movies with credits
 	if err := fetchAndDownload200Movies(); err != nil {
 		fmt.Printf("Error during automatic download: %v\n", err)
 		return
